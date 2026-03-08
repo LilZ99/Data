@@ -1,0 +1,1113 @@
+--[[
+╔══════════════════════════════════════════════════════════════╗
+║          ROBLOX DEBUG CONSOLE — DELTA MOBILE EDITION         ║
+║          Phiên bản: 2.0 | Tối ưu cho Mobile + Delta          ║
+╚══════════════════════════════════════════════════════════════╝
+  • Circular Buffer Log (RAM cố định)
+  • Async Chunked Copy (không drop FPS)
+  • Drag & Drop Panel, Touch-Friendly UI
+  • Safe Event Manager (không crash game)
+  • Auto Character Re-hook sau respawn
+  • Lọc log theo Level và Category
+]]
+
+-- ════════════════════════════════════════════════════════════
+-- SERVICES
+-- ════════════════════════════════════════════════════════════
+local Players            = game:GetService("Players")
+local TweenService       = game:GetService("TweenService")
+local UserInputService   = game:GetService("UserInputService")
+local RunService         = game:GetService("RunService")
+local Stats              = game:GetService("Stats")
+local HttpService        = game:GetService("HttpService")
+
+local LocalPlayer        = Players.LocalPlayer
+local PlayerGui          = LocalPlayer:WaitForChild("PlayerGui", 10)
+
+-- ════════════════════════════════════════════════════════════
+-- CONSTANTS & CONFIG
+-- ════════════════════════════════════════════════════════════
+local CFG = {
+    MAX_LOG_ENTRIES   = 600,          -- Giới hạn cứng RAM cho log
+    CHUNK_SIZE        = 40,           -- Entries serialize mỗi yield
+    FLUSH_INTERVAL    = 0.3,          -- Giây flush event queue
+    MAX_VISIBLE_ROWS  = 80,           -- Số TextLabel tối đa trong ScrollFrame
+    STATS_UPDATE_HZ   = 0.5,         -- Cập nhật FPS/MEM mỗi N giây
+    TOOL_NAME         = "DebugTool",
+    VERSION           = "2.0",
+}
+
+-- Màu sắc theo log level
+local LEVEL_COLOR = {
+    DEBUG = Color3.fromRGB(140, 140, 160),
+    INFO  = Color3.fromRGB(110, 200, 255),
+    WARN  = Color3.fromRGB(255, 210, 80),
+    ERROR = Color3.fromRGB(255, 90,  90),
+    EVENT = Color3.fromRGB(130, 230, 150),
+    COPY  = Color3.fromRGB(200, 150, 255),
+}
+
+-- Chỉ số ưu tiên để lọc
+local LEVEL_PRIORITY = { DEBUG=1, INFO=2, EVENT=3, WARN=4, ERROR=5, COPY=6 }
+
+-- Giao diện màu nền
+local THEME = {
+    BG          = Color3.fromRGB(8,   10,  16),
+    SURFACE     = Color3.fromRGB(18,  20,  30),
+    SURFACE2    = Color3.fromRGB(26,  28,  42),
+    BORDER      = Color3.fromRGB(45,  48,  70),
+    ACCENT      = Color3.fromRGB(99,  179, 255),
+    ACCENT2     = Color3.fromRGB(130, 100, 255),
+    SUCCESS     = Color3.fromRGB(80,  200, 120),
+    DANGER      = Color3.fromRGB(220, 70,  70),
+    TEXT        = Color3.fromRGB(215, 220, 235),
+    SUBTEXT     = Color3.fromRGB(100, 108, 135),
+    HIGHLIGHT   = Color3.fromRGB(99,  179, 255),
+}
+
+local TW_FAST   = TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local TW_MED    = TweenInfo.new(0.30, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local TW_SLOW   = TweenInfo.new(0.50, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 1: CIRCULAR LOG BUFFER
+-- ════════════════════════════════════════════════════════════
+local LogBuffer = {}
+LogBuffer.__index = LogBuffer
+
+function LogBuffer.new(maxSize)
+    return setmetatable({
+        _buf    = table.create(maxSize),  -- Pre-allocate, tránh resize
+        _head   = 1,
+        _count  = 0,
+        _max    = maxSize,
+        _filter = "ALL",  -- Lọc theo level: "ALL" hoặc tên level cụ thể
+        _catFilter = "ALL",
+        _onWrite = nil,   -- Callback mỗi khi có entry mới → cập nhật UI
+    }, LogBuffer)
+end
+
+-- Ghi log — O(1) không allocate thêm RAM
+function LogBuffer:write(level, category, message, data)
+    local entry = {
+        t  = os.clock(),
+        lv = level or "INFO",
+        ct = category or "SYS",
+        ms = message or "",
+        dt = data,
+        id = self._head,  -- ID duy nhất để track
+    }
+    self._buf[self._head] = entry
+    self._head  = (self._head % self._max) + 1
+    self._count = math.min(self._count + 1, self._max)
+
+    -- Trigger UI callback bất đồng bộ để không block caller
+    if self._onWrite then
+        task.defer(self._onWrite, entry)
+    end
+end
+
+-- Lấy entries theo thứ tự thời gian, áp filter
+function LogBuffer:getFiltered(levelFilter, catFilter)
+    local all = self:_getAllOrdered()
+    if (levelFilter == "ALL" or not levelFilter)
+    and (catFilter  == "ALL" or not catFilter) then
+        return all
+    end
+    local result = {}
+    for _, e in all do
+        local lvOk  = (levelFilter == "ALL") or (e.lv == levelFilter)
+        local catOk = (catFilter   == "ALL") or (e.ct == catFilter)
+        if lvOk and catOk then
+            result[#result+1] = e
+        end
+    end
+    return result
+end
+
+function LogBuffer:_getAllOrdered()
+    local result = table.create(self._count)
+    if self._count == 0 then return result end
+    local startIdx = (self._count < self._max)
+        and 1
+        or self._head  -- Wrap-around
+    for i = 1, self._count do
+        local idx = ((startIdx + i - 2) % self._max) + 1
+        result[i] = self._buf[idx]
+    end
+    return result
+end
+
+function LogBuffer:clear()
+    table.clear(self._buf)
+    self._head  = 1
+    self._count = 0
+end
+
+function LogBuffer:getCount() return self._count end
+
+-- Lấy tất cả category hiện có
+function LogBuffer:getCategories()
+    local seen, cats = {}, {"ALL"}
+    for _, e in self:_getAllOrdered() do
+        if not seen[e.ct] then
+            seen[e.ct] = true
+            cats[#cats+1] = e.ct
+        end
+    end
+    return cats
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 2: SAFE EVENT MANAGER
+-- ════════════════════════════════════════════════════════════
+local EventManager = {}
+EventManager.__index = EventManager
+
+function EventManager.new(logBuffer)
+    return setmetatable({
+        _conns  = {},
+        _log    = logBuffer,
+    }, EventManager)
+end
+
+function EventManager:connect(signal, category, handler)
+    local conn = signal:Connect(function(...)
+        local args = {...}
+        local ok, err = pcall(function()
+            handler(table.unpack(args))
+        end)
+        if not ok then
+            self._log:write("ERROR", category,
+                "Handler exception: " .. tostring(err))
+        end
+    end)
+    self._conns[#self._conns+1] = conn
+    return conn
+end
+
+function EventManager:disconnectAll()
+    for _, c in self._conns do
+        if typeof(c) == "RBXScriptConnection" and c.Connected then
+            c:Disconnect()
+        end
+    end
+    table.clear(self._conns)
+    self._log:write("DEBUG", "SYS", "All connections disconnected.")
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 3: CLIPBOARD EXPORTER (Async Chunked)
+-- ════════════════════════════════════════════════════════════
+
+-- Serialize 1 entry → 1 dòng, chỉ 1 string.format allocation
+local function serializeEntry(e)
+    local dtStr = ""
+    if e.dt then
+        local parts = {}
+        if type(e.dt) == "table" then
+            for k, v in e.dt do
+                parts[#parts+1] = tostring(k).."="..tostring(v)
+            end
+            dtStr = " {"..table.concat(parts, ", ").."}"
+        else
+            dtStr = " ["..tostring(e.dt).."]"
+        end
+    end
+    return string.format("[%08.3f] %-5s | %-10s | %s%s",
+        e.t, e.lv, e.ct, e.ms, dtStr)
+end
+
+local function exportAsync(logBuf, levelFilter, catFilter, onProgress, onDone)
+    task.spawn(function()
+        local entries = logBuf:getFiltered(levelFilter, catFilter)
+        local total   = #entries
+        if total == 0 then
+            onDone(false, "Không có log nào để copy.")
+            return
+        end
+
+        local lines     = table.create(total)
+        local processed = 0
+        local HEADER    = string.format(
+            "=== ROBLOX DEBUG LOG | %s | %d entries | %s ===\n",
+            CFG.TOOL_NAME, total, os.date and os.date("%Y-%m-%d") or "N/A"
+        )
+
+        -- Serialize theo chunk, yield giữa các chunk
+        while processed < total do
+            local chunkEnd  = math.min(processed + CFG.CHUNK_SIZE, total)
+            local t0        = os.clock()
+
+            for i = processed + 1, chunkEnd do
+                lines[i] = serializeEntry(entries[i])
+            end
+            processed = chunkEnd
+
+            if onProgress then
+                task.defer(onProgress, math.floor(processed/total*100))
+            end
+
+            -- Yield nếu đã dùng quá 10ms trong chunk này
+            if os.clock() - t0 > 0.010 then
+                task.wait()
+            end
+        end
+
+        -- O(n) join — không nối chuỗi trong vòng lặp
+        local fullText = HEADER .. table.concat(lines, "\n")
+
+        local ok, err = pcall(setclipboard, fullText)
+
+        -- Giải phóng RAM ngay
+        lines    = nil
+        fullText = nil
+        entries  = nil
+
+        if ok then
+            onDone(true, string.format("✅ Đã copy %d dòng log!", total))
+        else
+            onDone(false, "❌ Lỗi clipboard: " .. tostring(err))
+        end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 4: UI BUILDER
+-- ════════════════════════════════════════════════════════════
+
+-- Xóa GUI cũ nếu đã tồn tại (script re-run)
+local existingGui = PlayerGui:FindFirstChild(CFG.TOOL_NAME.."Gui")
+if existingGui then existingGui:Destroy() end
+
+local function corner(p, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = p; return c
+end
+
+local function padding(p, all, lr, tb)
+    local pad = Instance.new("UIPadding")
+    local a = UDim.new(0, all or 0)
+    pad.PaddingTop    = UDim.new(0, tb or all or 0)
+    pad.PaddingBottom = UDim.new(0, tb or all or 0)
+    pad.PaddingLeft   = UDim.new(0, lr or all or 0)
+    pad.PaddingRight  = UDim.new(0, lr or all or 0)
+    pad.Parent = p; return pad
+end
+
+local function stroke(p, color, thick, trans)
+    local s = Instance.new("UIStroke")
+    s.Color       = color or THEME.BORDER
+    s.Thickness   = thick or 1
+    s.Transparency = trans or 0
+    s.Parent = p; return s
+end
+
+local function label(p, props)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.TextColor3  = THEME.TEXT
+    l.Font        = Enum.Font.GothamMedium
+    l.TextSize    = 13
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Center
+    l.RichText    = true
+    for k,v in props do l[k]=v end
+    l.Parent = p; return l
+end
+
+local function btn(p, props, accent)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3  = accent or THEME.ACCENT
+    b.AutoButtonColor   = false
+    b.BorderSizePixel   = 0
+    b.Font              = Enum.Font.GothamBold
+    b.TextColor3        = Color3.new(1,1,1)
+    b.TextSize          = 12
+    for k,v in props do b[k]=v end
+    b.Parent = p
+    corner(b, 6)
+
+    -- Hiệu ứng nhấn touch/click
+    local function pressIn()
+        TweenService:Create(b, TW_FAST,
+            {BackgroundTransparency=0.35, Size=b.Size - UDim2.fromOffset(2,2)}
+        ):Play()
+    end
+    local function pressOut()
+        TweenService:Create(b, TW_FAST,
+            {BackgroundTransparency=0, Size=b.Size + UDim2.fromOffset(2,2)}
+        ):Play()
+    end
+    b.MouseButton1Down:Connect(pressIn)
+    b.MouseButton1Up:Connect(pressOut)
+    b.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then pressIn() end
+    end)
+    b.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch then pressOut() end
+    end)
+    return b
+end
+
+-- ── Build ScreenGui ──────────────────────────────────────────
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = CFG.TOOL_NAME.."Gui"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.DisplayOrder   = 1000
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.Parent         = PlayerGui
+
+-- Viewport reference
+local VP = workspace.CurrentCamera.ViewportSize
+
+-- ── BUBBLE (thu nhỏ) ────────────────────────────────────────
+local Bubble = Instance.new("TextButton")
+Bubble.Name             = "Bubble"
+Bubble.Size             = UDim2.fromOffset(56, 56)
+Bubble.Position         = UDim2.new(1, -70, 0.35, 0)
+Bubble.BackgroundColor3 = THEME.ACCENT2
+Bubble.Text             = "🐞"
+Bubble.TextSize         = 26
+Bubble.Font             = Enum.Font.GothamBold
+Bubble.ZIndex           = 20
+Bubble.AutoButtonColor  = false
+Bubble.Parent           = ScreenGui
+corner(Bubble, 28)
+
+-- Shadow bubble
+local BubbleShadow = Instance.new("Frame")
+BubbleShadow.Size               = UDim2.fromOffset(56, 56)
+BubbleShadow.Position           = UDim2.new(1, -68, 0.35, 2)
+BubbleShadow.BackgroundColor3   = Color3.new(0,0,0)
+BubbleShadow.BackgroundTransparency = 0.55
+BubbleShadow.ZIndex             = 19
+BubbleShadow.Parent             = ScreenGui
+corner(BubbleShadow, 28)
+
+-- Pulse animation cho Bubble khi idle
+local function pulseBubble()
+    local t1 = TweenService:Create(Bubble, TweenInfo.new(1.2,
+        Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+        {BackgroundColor3 = THEME.ACCENT})
+    t1:Play()
+end
+pulseBubble()
+
+-- Bubble draggable
+do
+    local drag, ds, bp = false, nil, nil
+    Bubble.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch
+        or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = true; ds = i.Position; bp = Bubble.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and (
+            i.UserInputType == Enum.UserInputType.Touch or
+            i.UserInputType == Enum.UserInputType.MouseMovement
+        ) then
+            local d = i.Position - ds
+            Bubble.Position = UDim2.new(
+                bp.X.Scale, bp.X.Offset + d.X,
+                bp.Y.Scale, bp.Y.Offset + d.Y)
+            BubbleShadow.Position = UDim2.new(
+                bp.X.Scale, bp.X.Offset + d.X + 2,
+                bp.Y.Scale, bp.Y.Offset + d.Y + 2)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch
+        or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = false
+        end
+    end)
+end
+
+-- ── MAIN PANEL ──────────────────────────────────────────────
+local PanelW, PanelH = 340, 480
+local Panel = Instance.new("Frame")
+Panel.Name              = "Panel"
+Panel.Size              = UDim2.fromOffset(0, 0)   -- Bắt đầu đóng
+Panel.Position          = UDim2.new(0.5, -PanelW/2, 0.5, -PanelH/2)
+Panel.BackgroundColor3  = THEME.BG
+Panel.BorderSizePixel   = 0
+Panel.ClipsDescendants  = true
+Panel.ZIndex            = 15
+Panel.Parent            = ScreenGui
+corner(Panel, 14)
+stroke(Panel, THEME.BORDER, 1, 0.3)
+
+-- ── HEADER ──────────────────────────────────────────────────
+local Header = Instance.new("Frame")
+Header.Name             = "Header"
+Header.Size             = UDim2.new(1,0, 0, 48)
+Header.BackgroundColor3 = THEME.SURFACE
+Header.BorderSizePixel  = 0
+Header.ZIndex           = 16
+Header.Parent           = Panel
+-- Bo góc trên bằng extra fill
+corner(Header, 14)
+local HFill = Instance.new("Frame")
+HFill.Size              = UDim2.new(1,0,0,14)
+HFill.Position          = UDim2.new(0,0,1,-14)
+HFill.BackgroundColor3  = THEME.SURFACE
+HFill.BorderSizePixel   = 0
+HFill.ZIndex            = 16
+HFill.Parent            = Header
+
+-- Accent line trên header
+local AccentLine = Instance.new("Frame")
+AccentLine.Size             = UDim2.new(0.6, 0, 0, 2)
+AccentLine.Position         = UDim2.new(0.2, 0, 0, 0)
+AccentLine.BackgroundColor3 = THEME.ACCENT2
+AccentLine.BorderSizePixel  = 0
+AccentLine.ZIndex           = 17
+AccentLine.Parent           = Header
+corner(AccentLine, 1)
+
+-- Title
+local TitleLbl = label(Header, {
+    Size     = UDim2.new(1, -110, 1, 0),
+    Position = UDim2.fromOffset(14, 0),
+    Text     = string.format("<b>🐞 Debug Console</b> <font color='#636B9A' size='11'>v%s</font>", CFG.VERSION),
+    TextSize = 14,
+    ZIndex   = 17,
+})
+
+-- Stats mini (FPS + MEM) di header
+local StatsLbl = label(Header, {
+    Size             = UDim2.fromOffset(95, 40),
+    Position         = UDim2.new(1, -100, 0, 4),
+    Text             = "FPS: -- | MEM: --",
+    TextSize         = 10,
+    TextColor3       = THEME.SUBTEXT,
+    TextXAlignment   = Enum.TextXAlignment.Right,
+    Font             = Enum.Font.Code,
+    ZIndex           = 17,
+})
+
+-- Close button
+local CloseBtn = btn(Header, {
+    Size     = UDim2.fromOffset(28, 28),
+    Position = UDim2.new(1, -36, 0.5, -14),
+    Text     = "✕",
+    TextSize = 14,
+    ZIndex   = 17,
+}, THEME.DANGER)
+
+-- ── FILTER BAR ──────────────────────────────────────────────
+local FilterBar = Instance.new("Frame")
+FilterBar.Name              = "FilterBar"
+FilterBar.Size              = UDim2.new(1, -12, 0, 32)
+FilterBar.Position          = UDim2.fromOffset(6, 52)
+FilterBar.BackgroundColor3  = THEME.SURFACE2
+FilterBar.BorderSizePixel   = 0
+FilterBar.ZIndex            = 16
+FilterBar.Parent            = Panel
+corner(FilterBar, 7)
+
+local FilterLayout = Instance.new("UIListLayout")
+FilterLayout.FillDirection      = Enum.FillDirection.Horizontal
+FilterLayout.VerticalAlignment  = Enum.VerticalAlignment.Center
+FilterLayout.Padding            = UDim.new(0, 4)
+FilterLayout.Parent             = FilterBar
+padding(FilterBar, 0, 6, 0)
+
+-- Filter buttons cho mỗi level
+local FILTER_LEVELS = {"ALL","DEBUG","INFO","EVENT","WARN","ERROR"}
+local filterBtns    = {}
+local activeFilter  = "ALL"
+
+local function makeFilterBtn(lvl)
+    local color = LEVEL_COLOR[lvl] or THEME.ACCENT
+    local b = Instance.new("TextButton")
+    b.Size               = UDim2.fromOffset(lvl == "ALL" and 34 or 44, 22)
+    b.BackgroundColor3   = (lvl == "ALL") and THEME.ACCENT or THEME.SURFACE
+    b.Text               = lvl
+    b.TextColor3         = (lvl == "ALL") and Color3.new(0,0,0) or color
+    b.Font               = Enum.Font.GothamBold
+    b.TextSize           = 9
+    b.AutoButtonColor    = false
+    b.ZIndex             = 17
+    b.Parent             = FilterBar
+    corner(b, 5)
+    return b
+end
+
+for _, lvl in FILTER_LEVELS do
+    filterBtns[lvl] = makeFilterBtn(lvl)
+end
+
+-- ── SCROLL AREA ─────────────────────────────────────────────
+local LogScroll = Instance.new("ScrollingFrame")
+LogScroll.Name                  = "LogScroll"
+LogScroll.Size                  = UDim2.new(1, -8, 1, -136)
+LogScroll.Position              = UDim2.fromOffset(4, 90)
+LogScroll.BackgroundColor3      = THEME.BG
+LogScroll.BorderSizePixel       = 0
+LogScroll.ScrollBarThickness    = 3
+LogScroll.ScrollBarImageColor3  = THEME.ACCENT2
+LogScroll.CanvasSize            = UDim2.fromOffset(0,0)
+LogScroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+LogScroll.ZIndex                = 16
+LogScroll.Parent                = Panel
+
+local LogLayout = Instance.new("UIListLayout")
+LogLayout.SortOrder = Enum.SortOrder.LayoutOrder
+LogLayout.Padding   = UDim.new(0, 1)
+LogLayout.Parent    = LogScroll
+padding(LogScroll, 3)
+
+-- ── TOOLBAR ─────────────────────────────────────────────────
+local Toolbar = Instance.new("Frame")
+Toolbar.Name            = "Toolbar"
+Toolbar.Size            = UDim2.new(1, 0, 0, 44)
+Toolbar.Position        = UDim2.new(0, 0, 1, -44)
+Toolbar.BackgroundColor3 = THEME.SURFACE
+Toolbar.BorderSizePixel = 0
+Toolbar.ZIndex          = 16
+Toolbar.Parent          = Panel
+
+local TBLayout = Instance.new("UIListLayout")
+TBLayout.FillDirection      = Enum.FillDirection.Horizontal
+TBLayout.VerticalAlignment  = Enum.VerticalAlignment.Center
+TBLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+TBLayout.Padding            = UDim.new(0, 6)
+TBLayout.Parent             = Toolbar
+padding(Toolbar, 0, 6, 0)
+
+-- Toolbar separator line
+local TBLine = Instance.new("Frame")
+TBLine.Size             = UDim2.new(1, 0, 0, 1)
+TBLine.BackgroundColor3 = THEME.BORDER
+TBLine.BorderSizePixel  = 0
+TBLine.ZIndex           = 16
+TBLine.Parent           = Toolbar
+
+local CopyBtn  = btn(Toolbar, {
+    Size=UDim2.fromOffset(90,32), Text="📋 Copy Log", TextSize=11, ZIndex=17
+}, THEME.ACCENT)
+local ClearBtn = btn(Toolbar, {
+    Size=UDim2.fromOffset(72,32), Text="🗑 Clear", TextSize=11, ZIndex=17
+}, THEME.DANGER)
+local HookBtn  = btn(Toolbar, {
+    Size=UDim2.fromOffset(88,32), Text="🔗 Re-hook", TextSize=11, ZIndex=17
+}, Color3.fromRGB(80,160,100))
+
+-- ── ENTRY COUNT BADGE ───────────────────────────────────────
+local CountBadge = Instance.new("TextLabel")
+CountBadge.Size             = UDim2.fromOffset(80, 20)
+CountBadge.Position         = UDim2.new(0, 8, 1, -118)
+CountBadge.BackgroundColor3 = THEME.SURFACE2
+CountBadge.BackgroundTransparency = 0.3
+CountBadge.Text             = "0 entries"
+CountBadge.TextColor3       = THEME.SUBTEXT
+CountBadge.Font             = Enum.Font.Code
+CountBadge.TextSize         = 10
+CountBadge.ZIndex           = 16
+CountBadge.Parent           = Panel
+corner(CountBadge, 4)
+padding(CountBadge, 0, 4, 0)
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 5: LOG RENDERER (Object Pool)
+-- ════════════════════════════════════════════════════════════
+-- Dùng Object Pool để không tạo/xóa TextLabel liên tục → giảm GC
+local RowPool = {}
+local ROW_H   = 18
+
+local function getPooledRow()
+    if #RowPool > 0 then
+        local r = table.remove(RowPool)
+        r.Visible = true
+        return r
+    end
+    local f = Instance.new("Frame")
+    f.Size              = UDim2.new(1, 0, 0, ROW_H)
+    f.BackgroundTransparency = 1
+    f.BorderSizePixel   = 0
+    f.ZIndex            = 17
+
+    local t = Instance.new("TextLabel", f)
+    t.Name              = "Txt"
+    t.Size              = UDim2.new(1, -4, 1, 0)
+    t.Position          = UDim2.fromOffset(2, 0)
+    t.BackgroundTransparency = 1
+    t.Font              = Enum.Font.Code
+    t.TextSize          = 11
+    t.TextXAlignment    = Enum.TextXAlignment.Left
+    t.TextYAlignment    = Enum.TextYAlignment.Center
+    t.TextTruncate      = Enum.TextTruncate.AtEnd
+    t.RichText          = false
+    t.ZIndex            = 17
+    return f
+end
+
+local function recycleRow(row)
+    row.Visible = false
+    row.Parent  = nil
+    RowPool[#RowPool+1] = row
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 6: LOG BUFFER INSTANCE & RENDER STATE
+-- ════════════════════════════════════════════════════════════
+local LOG     = LogBuffer.new(CFG.MAX_LOG_ENTRIES)
+local EV_MGR  = EventManager.new(LOG)
+
+local renderedRows   = {}   -- { frame, entry } của các row đang hiển thị
+local needsRebuild   = false
+local currentFilter  = "ALL"
+local autoScroll     = true
+
+-- Rebuild toàn bộ danh sách log rows
+local function rebuildLogRows()
+    -- Recycle rows cũ vào pool
+    for _, r in renderedRows do recycleRow(r.frame) end
+    table.clear(renderedRows)
+
+    local entries = LOG:getFiltered(
+        currentFilter == "ALL" and "ALL" or currentFilter, "ALL"
+    )
+
+    -- Giới hạn visible rows để tránh quá nhiều TextLabel
+    local startIdx = math.max(1, #entries - CFG.MAX_VISIBLE_ROWS)
+
+    for i = startIdx, #entries do
+        local e   = entries[i]
+        local row = getPooledRow()
+        local col = LEVEL_COLOR[e.lv] or THEME.TEXT
+
+        -- Màu nền xen kẽ nhẹ
+        row.BackgroundTransparency = (i % 2 == 0) and 0.97 or 1
+        row.BackgroundColor3       = THEME.SURFACE
+
+        local txt = row:FindFirstChild("Txt")
+        txt.TextColor3 = col
+        txt.Text = string.format("[%.2f] %s | %s | %s",
+            e.t, e.lv, e.ct, e.ms)
+
+        row.LayoutOrder = i
+        row.Parent      = LogScroll
+
+        renderedRows[#renderedRows+1] = { frame=row, entry=e }
+    end
+
+    CountBadge.Text = tostring(LOG:getCount()).." entries"
+
+    -- Auto scroll xuống cuối
+    if autoScroll then
+        task.defer(function()
+            local cs = LogScroll.AbsoluteCanvasSize.Y
+            local fs = LogScroll.AbsoluteSize.Y
+            if cs > fs then
+                LogScroll.CanvasPosition = Vector2.new(0, cs - fs)
+            end
+        end)
+    end
+
+    needsRebuild = false
+end
+
+-- Trigger rebuild bất đồng bộ (debounce)
+local rebuildPending = false
+local function scheduleRebuild()
+    if rebuildPending then return end
+    rebuildPending = true
+    task.defer(function()
+        rebuildLogRows()
+        rebuildPending = false
+    end)
+end
+
+LOG._onWrite = function(_)
+    scheduleRebuild()
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 7: PANEL OPEN/CLOSE + DRAG
+-- ════════════════════════════════════════════════════════════
+local isOpen = false
+local OPEN_SIZE = UDim2.fromOffset(PanelW, PanelH)
+
+local function openPanel()
+    isOpen = true
+    Panel.Size = UDim2.fromOffset(0, 0)
+    Panel.Visible = true
+    TweenService:Create(Panel, TW_MED, {Size = OPEN_SIZE}):Play()
+    TweenService:Create(Bubble, TW_FAST, {Rotation = 15}):Play()
+    scheduleRebuild()
+end
+
+local function closePanel()
+    isOpen = false
+    TweenService:Create(Panel, TW_MED, {Size = UDim2.fromOffset(0,0)}):Play()
+    TweenService:Create(Bubble, TW_FAST, {Rotation = 0}):Play()
+    task.delay(TW_MED.Time, function()
+        if not isOpen then Panel.Visible = false end
+    end)
+end
+
+Bubble.MouseButton1Click:Connect(function()
+    if isOpen then closePanel() else openPanel() end
+end)
+CloseBtn.MouseButton1Click:Connect(closePanel)
+
+-- Panel drag (kéo qua header)
+do
+    local drag, ds, pp = false, nil, nil
+    Header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch
+        or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag=true; ds=i.Position; pp=Panel.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if not drag then return end
+        if i.UserInputType ~= Enum.UserInputType.Touch
+        and i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local d = i.Position - ds
+        Panel.Position = UDim2.new(
+            pp.X.Scale, pp.X.Offset + d.X,
+            pp.Y.Scale, pp.Y.Offset + d.Y)
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.Touch
+        or i.UserInputType == Enum.UserInputType.MouseButton1 then
+            drag = false
+        end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 8: FILTER BUTTON LOGIC
+-- ════════════════════════════════════════════════════════════
+local function setFilter(lvl)
+    currentFilter = lvl
+    for l, b in filterBtns do
+        local isActive = (l == lvl)
+        local col      = LEVEL_COLOR[l] or THEME.ACCENT
+        TweenService:Create(b, TW_FAST, {
+            BackgroundColor3 = isActive and (col) or THEME.SURFACE,
+            TextColor3       = isActive
+                and (l == "ALL" and Color3.new(0,0,0) or Color3.new(1,1,1))
+                or col,
+        }):Play()
+    end
+    scheduleRebuild()
+end
+
+for lvl, b in filterBtns do
+    b.MouseButton1Click:Connect(function() setFilter(lvl) end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 9: TOOLBAR ACTIONS
+-- ════════════════════════════════════════════════════════════
+local isCopying = false
+
+CopyBtn.MouseButton1Click:Connect(function()
+    if isCopying then return end
+    isCopying = true
+    LOG:write("COPY", "SYS", "Bắt đầu export log...", {filter=currentFilter})
+
+    local origText  = CopyBtn.Text
+    local origColor = CopyBtn.BackgroundColor3
+    CopyBtn.Text    = "⏳ 0%"
+    TweenService:Create(CopyBtn, TW_FAST,
+        {BackgroundColor3=THEME.SURFACE2}):Play()
+
+    exportAsync(
+        LOG, currentFilter, "ALL",
+        function(pct)
+            CopyBtn.Text = string.format("⏳ %d%%", pct)
+        end,
+        function(ok, msg)
+            LOG:write(ok and "COPY" or "ERROR", "SYS", msg)
+            CopyBtn.Text = ok and "✅ Done!" or "❌ Error"
+            TweenService:Create(CopyBtn, TW_FAST, {
+                BackgroundColor3 = ok and THEME.SUCCESS or THEME.DANGER
+            }):Play()
+
+            task.delay(2.5, function()
+                if CopyBtn and CopyBtn.Parent then
+                    CopyBtn.Text = origText
+                    TweenService:Create(CopyBtn, TW_MED,
+                        {BackgroundColor3=origColor}):Play()
+                    isCopying = false
+                end
+            end)
+        end
+    )
+end)
+
+ClearBtn.MouseButton1Click:Connect(function()
+    LOG:clear()
+    for _, r in renderedRows do recycleRow(r.frame) end
+    table.clear(renderedRows)
+    CountBadge.Text = "0 entries"
+    LOG:write("INFO", "SYS", "Log đã được xóa.")
+end)
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 10: GAME EVENT HOOKS
+-- ════════════════════════════════════════════════════════════
+local charConns = {}  -- Connections riêng cho character (reset mỗi respawn)
+
+local function hookCharacter(char)
+    -- Xóa connections cũ trước
+    for _, c in charConns do
+        if c.Connected then c:Disconnect() end
+    end
+    table.clear(charConns)
+
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        LOG:write("WARN", "CHAR", "Không tìm thấy Humanoid trong Character!")
+        return
+    end
+
+    LOG:write("EVENT", "CHAR", "Character hooked: "..char.Name)
+
+    -- Health
+    charConns[#charConns+1] = humanoid.HealthChanged:Connect(function(hp)
+        LOG:write("INFO", "HEALTH",
+            string.format("HP thay đổi → %.1f / %.1f", hp, humanoid.MaxHealth),
+            {pct=math.floor(hp/humanoid.MaxHealth*100)})
+    end)
+
+    -- State
+    charConns[#charConns+1] = humanoid.StateChanged:Connect(function(_, new)
+        LOG:write("DEBUG", "STATE", tostring(new))
+    end)
+
+    -- Died
+    charConns[#charConns+1] = humanoid.Died:Connect(function()
+        LOG:write("WARN", "CHAR", "Nhân vật đã chết.")
+    end)
+
+    -- Tool equipped/unequipped
+    charConns[#charConns+1] = char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            LOG:write("EVENT", "TOOL", "Trang bị: "..child.Name)
+        end
+    end)
+    charConns[#charConns+1] = char.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") then
+            LOG:write("EVENT", "TOOL", "Bỏ trang bị: "..child.Name)
+        end
+    end)
+
+    -- Cleanup khi char bị destroy
+    charConns[#charConns+1] = char.AncestryChanged:Connect(function(_, p)
+        if not p then
+            LOG:write("DEBUG", "CHAR", "Character removed from Workspace.")
+        end
+    end)
+
+    -- Position logger mỗi 3 giây (nhẹ)
+    local posConn
+    posConn = RunService.Heartbeat:Connect(function()
+        -- Chỉ log mỗi 3s dùng os.clock
+        if not posConn then return end
+    end)
+
+    -- Thay bằng loop tách biệt để tránh Heartbeat overhead
+    task.spawn(function()
+        while humanoid and humanoid.Parent do
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local p = root.Position
+                LOG:write("DEBUG", "POS",
+                    string.format("(%.1f, %.1f, %.1f)", p.X, p.Y, p.Z))
+            end
+            task.wait(3)
+        end
+    end)
+end
+
+-- Hook character hiện tại
+if LocalPlayer.Character then
+    hookCharacter(LocalPlayer.Character)
+end
+
+-- Auto re-hook khi respawn
+EV_MGR:connect(LocalPlayer.CharacterAdded, "SYS", function(char)
+    LOG:write("EVENT", "SYS", "CharacterAdded → đang re-hook...")
+    task.wait(0.5)  -- Đợi character load xong
+    hookCharacter(char)
+end)
+
+-- Re-hook button thủ công
+HookBtn.MouseButton1Click:Connect(function()
+    local char = LocalPlayer.Character
+    if char then
+        hookCharacter(char)
+        LOG:write("EVENT", "SYS", "Re-hook thủ công thành công.")
+    else
+        LOG:write("WARN", "SYS", "Không có Character để hook!")
+    end
+end)
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 11: STATS (FPS + RAM)
+-- ════════════════════════════════════════════════════════════
+do
+    local frameCount  = 0
+    local lastFPSTime = os.clock()
+    local lastStatsUp = 0
+
+    RunService.RenderStepped:Connect(function()
+        frameCount = frameCount + 1
+    end)
+
+    RunService.Heartbeat:Connect(function()
+        local now = os.clock()
+        if now - lastStatsUp < CFG.STATS_UPDATE_HZ then return end
+        lastStatsUp = now
+
+        local elapsed = now - lastFPSTime
+        local fps     = math.floor(frameCount / elapsed)
+        frameCount    = 0
+        lastFPSTime   = now
+
+        local mem = math.floor(collectgarbage("count") / 1024 * 10) / 10
+
+        StatsLbl.Text = string.format("FPS:%d | MEM:%.1fMB", fps, mem)
+
+        -- Đổi màu FPS warning
+        StatsLbl.TextColor3 = fps < 20 and THEME.DANGER
+            or fps < 40 and LEVEL_COLOR.WARN
+            or THEME.SUBTEXT
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MODULE 12: PLAYER / REMOTE MONITORING
+-- ════════════════════════════════════════════════════════════
+
+-- Log khi player khác vào/ra
+EV_MGR:connect(Players.PlayerAdded, "NETWORK", function(p)
+    LOG:write("INFO", "NETWORK", "Player joined: "..p.Name,
+        {uid=p.UserId})
+end)
+EV_MGR:connect(Players.PlayerRemoving, "NETWORK", function(p)
+    LOG:write("INFO", "NETWORK", "Player left: "..p.Name)
+end)
+
+-- Remote log: hook tất cả RemoteEvent trong ReplicatedStorage
+local function hookRemotes()
+    local RS = game:GetService("ReplicatedStorage")
+    local function tryHookRemote(obj)
+        if not obj:IsA("RemoteEvent") and not obj:IsA("RemoteFunction") then return end
+        local name = obj.Name
+        -- Chỉ hook OnClientEvent (phía client)
+        if obj:IsA("RemoteEvent") then
+            local ok = pcall(function()
+                EV_MGR:connect(obj.OnClientEvent, "REMOTE", function(...)
+                    local args = {...}
+                    local summary = {}
+                    for i, v in args do
+                        summary[i] = type(v).."("..tostring(v):sub(1,20)..")"
+                    end
+                    LOG:write("EVENT", "REMOTE",
+                        name..": "..table.concat(summary," | "))
+                end)
+            end)
+            if not ok then
+                LOG:write("DEBUG","REMOTE","Không hook được: "..name)
+            end
+        end
+    end
+
+    -- Hook toàn bộ existing remotes
+    for _, obj in RS:GetDescendants() do
+        tryHookRemote(obj)
+    end
+    -- Hook remotes mới được tạo
+    EV_MGR:connect(RS.DescendantAdded, "REMOTE", tryHookRemote)
+    LOG:write("INFO", "REMOTE",
+        string.format("Đã scan %d RemoteEvents.", #RS:GetDescendants()))
+end
+
+-- Gọi hookRemotes trong pcall để không crash nếu quyền bị giới hạn
+local ok, err = pcall(hookRemotes)
+if not ok then
+    LOG:write("WARN", "REMOTE", "hookRemotes thất bại: "..tostring(err))
+end
+
+-- ════════════════════════════════════════════════════════════
+-- KHỞI ĐỘNG
+-- ════════════════════════════════════════════════════════════
+LOG:write("INFO", "SYS",
+    string.format("🐞 Debug Tool v%s khởi động thành công!", CFG.VERSION))
+LOG:write("INFO", "SYS",
+    string.format("Game: %s | PlaceId: %d | Player: %s",
+        game.Name or "Unknown",
+        game.PlaceId,
+        LocalPlayer.Name))
+LOG:write("INFO", "SYS", "Nhấn 🐞 để mở/đóng panel. Kéo Header để di chuyển.")
+LOG:write("DEBUG","SYS",
+    string.format("MAX_ENTRIES=%d | CHUNK_SIZE=%d | POOL_START=0",
+        CFG.MAX_LOG_ENTRIES, CFG.CHUNK_SIZE))
+
+-- Thông báo khởi động
+do
+    local toast = Instance.new("TextLabel")
+    toast.Size               = UDim2.fromOffset(220, 36)
+    toast.Position           = UDim2.new(0.5, -110, 0, -40)
+    toast.BackgroundColor3   = THEME.ACCENT2
+    toast.Text               = "🐞 Debug Tool đã kích hoạt!"
+    toast.TextColor3         = Color3.new(1,1,1)
+    toast.Font               = Enum.Font.GothamBold
+    toast.TextSize           = 13
+    toast.BorderSizePixel    = 0
+    toast.ZIndex             = 30
+    toast.Parent             = ScreenGui
+    corner(toast, 8)
+
+    TweenService:Create(toast, TW_MED,
+        {Position = UDim2.new(0.5,-110, 0, 8)}):Play()
+
+    task.delay(3, function()
+        TweenService:Create(toast, TW_MED,
+            {Position = UDim2.new(0.5,-110, 0, -50),
+             BackgroundTransparency = 1}):Play()
+        task.delay(TW_MED.Time, function()
+            toast:Destroy()
+        end)
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- CLEANUP khi script bị terminate
+-- ════════════════════════════════════════════════════════════
+-- Delta hỗ trợ script termination callback qua getgenv flag
+getgenv().__DebugToolCleanup = function()
+    EV_MGR:disconnectAll()
+    for _, c in charConns do
+        if c.Connected then c:Disconnect() end
+    end
+    if ScreenGui and ScreenGui.Parent then
+        ScreenGui:Destroy()
+    end
+    LOG:clear()
+    table.clear(RowPool)
+    print("[DebugTool] Cleanup hoàn tất.")
+end
+
+-- Nếu chạy lại script, cleanup session cũ tự động
+if getgenv().__DebugToolActive then
+    pcall(getgenv().__DebugToolCleanup)
+end
+getgenv().__DebugToolActive = true
+
+print(string.format(
+    "[DebugTool v%s] Load thành công — %d modules active.",
+    CFG.VERSION, 12
+))
+
+
